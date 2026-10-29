@@ -1,0 +1,119 @@
+# One prefill pod and one decode pod, 1 GPU each, KV handed over by NIXL.
+# No routing sidecar: the coordinator drives prefill -> decode itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fc-vllm, llm-d.ai/role: prefill}
+  template:
+    metadata:
+      labels: {app: fc-vllm, llm-d.ai/role: prefill}
+    spec:
+      tolerations:
+        - {key: is_gpu, operator: Exists, effect: PreferNoSchedule}
+      containers:
+        - name: vllm
+          image: docker.io/vllm/vllm-openai@sha256:dea7fa047caa114167efccdeb42321b12d2c11da1add8728aa2662cb8d6b8cd5 # nightly 2026-09-18
+          securityContext:
+            capabilities: {add: [IPC_LOCK, SYS_RAWIO]}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |-
+              set -euo pipefail
+              python3 -c "import nixl" 2>/dev/null || uv pip install --system nixl nixl-cu13
+              exec vllm serve Qwen/Qwen3-8B \
+                --port 8000 \
+                --max-model-len 16384 \
+                --disable-access-log-for-endpoints=/health,/metrics \
+                --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+          env:
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: HF_HUB_CACHE, value: /var/cache/huggingface}
+            - {name: VLLM_CACHE_ROOT, value: /var/cache/vllm/vllm}
+            - {name: NCCL_IB_HCA, value: ibp}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            requests: {cpu: "8", memory: 64Gi, nvidia.com/gpu: "1", rdma/ib: "1"}
+            limits: {memory: 64Gi, nvidia.com/gpu: "1", rdma/ib: "1"}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 360
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: hf-cache, mountPath: /var/cache/huggingface}
+            - {name: jit-cache, mountPath: /var/cache/vllm}
+      volumes:
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
+        - name: hf-cache
+          hostPath: {path: /mnt/local/hf-cache, type: DirectoryOrCreate}
+        - name: jit-cache
+          hostPath: {path: /mnt/local/jit-cache, type: DirectoryOrCreate}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-decode
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fc-vllm, llm-d.ai/role: decode}
+  template:
+    metadata:
+      labels: {app: fc-vllm, llm-d.ai/role: decode}
+    spec:
+      tolerations:
+        - {key: is_gpu, operator: Exists, effect: PreferNoSchedule}
+      containers:
+        - name: vllm
+          image: docker.io/vllm/vllm-openai@sha256:dea7fa047caa114167efccdeb42321b12d2c11da1add8728aa2662cb8d6b8cd5 # nightly 2026-09-18
+          securityContext:
+            capabilities: {add: [IPC_LOCK, SYS_RAWIO]}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |-
+              set -euo pipefail
+              python3 -c "import nixl" 2>/dev/null || uv pip install --system nixl nixl-cu13
+              exec vllm serve Qwen/Qwen3-8B \
+                --port 8000 \
+                --max-model-len 16384 \
+                --disable-access-log-for-endpoints=/health,/metrics \
+                --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+          env:
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: HF_HUB_CACHE, value: /var/cache/huggingface}
+            - {name: VLLM_CACHE_ROOT, value: /var/cache/vllm/vllm}
+            - {name: NCCL_IB_HCA, value: ibp}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            requests: {cpu: "8", memory: 64Gi, nvidia.com/gpu: "1", rdma/ib: "1"}
+            limits: {memory: 64Gi, nvidia.com/gpu: "1", rdma/ib: "1"}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 360
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: hf-cache, mountPath: /var/cache/huggingface}
+            - {name: jit-cache, mountPath: /var/cache/vllm}
+      volumes:
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
+        - name: hf-cache
+          hostPath: {path: /mnt/local/hf-cache, type: DirectoryOrCreate}
+        - name: jit-cache
+          hostPath: {path: /mnt/local/jit-cache, type: DirectoryOrCreate}

@@ -1,0 +1,25 @@
+# Decode EPP: no flow control, on purpose.
+#
+# A request only reaches decode after its prefill ran and the KV is waiting on
+# the prefill pod. Queueing or evicting it here would throw that work away, so
+# admission is decided once, at prefill (epp-prefill.yaml), and decode always
+# dispatches immediately.
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+
+plugins:
+  - type: openai-parser
+  - type: inflight-load-producer
+  - type: active-request-scorer
+  - type: max-score-picker
+  - type: single-profile-handler
+
+requestHandler:
+  parsers:
+    - pluginRef: openai-parser
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: active-request-scorer
+      - pluginRef: max-score-picker

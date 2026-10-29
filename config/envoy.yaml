@@ -1,0 +1,179 @@
+# The inference gateway. Three routes on one listener:
+#
+#   no x-llm-d-epp-profile          -> coordinator (client entry point, no EPP)
+#   x-llm-d-epp-profile: prefill    -> prefill EPP picks a prefill pod (flow control)
+#   x-llm-d-epp-profile: decode     -> decode EPP picks a decode pod
+#
+# The coordinator calls back into this same listener once per phase.
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 19000}
+static_resources:
+  listeners:
+    - name: ready
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 19001}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ready
+                route_config:
+                  virtual_hosts:
+                    - name: stats
+                      domains: ["*"]
+                      routes:
+                        - match: {prefix: /stats/prometheus}
+                          route: {cluster: admin}
+                http_filters:
+                  - name: envoy.filters.http.health_check
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                      pass_through_mode: false
+                      headers:
+                        - name: ":path"
+                          string_match: {exact: /ready}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - name: gateway
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 8081}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: gateway
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "%START_TIME% %REQ(:PATH)% profile=%REQ(X-LLM-D-EPP-PROFILE)% code=%RESPONSE_CODE% dropped=%RESP(X-LLM-D-REQUEST-DROPPED-REASON)% upstream=%UPSTREAM_HOST% dur=%DURATION%ms\n"
+                route_config:
+                  virtual_hosts:
+                    - name: gateway
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: /
+                            headers:
+                              - name: x-llm-d-epp-profile
+                                string_match: {exact: prefill}
+                          route: {cluster: picked_endpoint, timeout: 0s}
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              overrides:
+                                grpc_service:
+                                  envoy_grpc: {cluster_name: epp_prefill}
+                        - match:
+                            prefix: /
+                            headers:
+                              - name: x-llm-d-epp-profile
+                                string_match: {exact: decode}
+                          route: {cluster: picked_endpoint, timeout: 0s}
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              overrides:
+                                grpc_service:
+                                  envoy_grpc: {cluster_name: epp_decode}
+                        - match: {prefix: /}
+                          route: {cluster: coordinator, timeout: 0s}
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              disabled: true
+                http_filters:
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      # Overridden per route above.
+                      grpc_service:
+                        envoy_grpc: {cluster_name: epp_decode}
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SEND
+                        request_body_mode: FULL_DUPLEX_STREAMED
+                        response_body_mode: FULL_DUPLEX_STREAMED
+                        request_trailer_mode: SEND
+                        response_trailer_mode: SEND
+                      # A queued request holds its ext_proc message until the
+                      # EPP dispatches or evicts it: keep this above the TTL.
+                      message_timeout: 1000s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+  clusters:
+    - name: admin
+      type: STATIC
+      load_assignment:
+        cluster_name: admin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 19000}
+    # Destination comes from the EPP's x-gateway-destination-endpoint header.
+    - name: picked_endpoint
+      type: ORIGINAL_DST
+      lb_policy: CLUSTER_PROVIDED
+      connect_timeout: 10s
+      circuit_breakers:
+        thresholds:
+          - {max_connections: 40000, max_pending_requests: 40000, max_requests: 40000}
+      original_dst_lb_config:
+        use_http_header: true
+        http_header_name: x-gateway-destination-endpoint
+    - name: coordinator
+      type: STRICT_DNS
+      connect_timeout: 5s
+      circuit_breakers:
+        thresholds:
+          - {max_connections: 40000, max_pending_requests: 40000, max_requests: 40000}
+      load_assignment:
+        cluster_name: coordinator
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: fc-coordinator, port_value: 8080}
+    - name: epp_prefill
+      type: STRICT_DNS
+      connect_timeout: 5s
+      circuit_breakers:
+        thresholds:
+          - {max_connections: 40000, max_pending_requests: 40000, max_requests: 40000}
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: {http2_protocol_options: {}}
+      load_assignment:
+        cluster_name: epp_prefill
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: fc-epp-prefill, port_value: 9002}
+    - name: epp_decode
+      type: STRICT_DNS
+      connect_timeout: 5s
+      circuit_breakers:
+        thresholds:
+          - {max_connections: 40000, max_pending_requests: 40000, max_requests: 40000}
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: {http2_protocol_options: {}}
+      load_assignment:
+        cluster_name: epp_decode
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: fc-epp-decode, port_value: 9002}

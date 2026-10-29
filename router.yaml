@@ -1,0 +1,238 @@
+# Two role-scoped InferencePools, each with its own EPP, plus the coordinator
+# and the Envoy gateway in front of everything.
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: fc-prefill
+spec:
+  selector:
+    matchLabels: {app: fc-vllm, llm-d.ai/role: prefill}
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    name: fc-epp-prefill
+    kind: Service
+    port: {number: 9002}
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: fc-decode
+spec:
+  selector:
+    matchLabels: {app: fc-vllm, llm-d.ai/role: decode}
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    name: fc-epp-decode
+    kind: Service
+    port: {number: 9002}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-epp-prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fc-epp-prefill}
+  template:
+    metadata:
+      labels: {app: fc-epp-prefill}
+    spec:
+      serviceAccountName: fc-epp
+      containers:
+        - name: epp
+          image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v1.0.0
+          args:
+            - --pool-name=fc-prefill
+            - --pool-namespace=$(NAMESPACE)
+            - --config-file=/etc/epp/config.yaml
+            - --secure-serving=false
+            - --metrics-endpoint-auth=false
+            - --allow-experimental-plugins=true
+            - --grpc-port=9002
+            - --grpc-health-port=9003
+          env:
+            - name: NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: grpc, containerPort: 9002}
+            - {name: grpc-health, containerPort: 9003}
+            - {name: metrics, containerPort: 9090}
+          readinessProbe:
+            grpc: {port: 9003, service: readiness}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: config, mountPath: /etc/epp}
+      volumes:
+        - name: config
+          configMap: {name: fc-epp-prefill}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-epp-decode
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fc-epp-decode}
+  template:
+    metadata:
+      labels: {app: fc-epp-decode}
+    spec:
+      serviceAccountName: fc-epp
+      containers:
+        - name: epp
+          image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v1.0.0
+          args:
+            - --pool-name=fc-decode
+            - --pool-namespace=$(NAMESPACE)
+            - --config-file=/etc/epp/config.yaml
+            - --secure-serving=false
+            - --metrics-endpoint-auth=false
+            - --grpc-port=9002
+            - --grpc-health-port=9003
+          env:
+            - name: NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: grpc, containerPort: 9002}
+            - {name: grpc-health, containerPort: 9003}
+            - {name: metrics, containerPort: 9090}
+          readinessProbe:
+            grpc: {port: 9003, service: readiness}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: config, mountPath: /etc/epp}
+      volumes:
+        - name: config
+          configMap: {name: fc-epp-decode}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-epp-prefill
+spec:
+  selector: {app: fc-epp-prefill}
+  ports:
+    - {name: grpc, port: 9002, appProtocol: http2}
+    - {name: metrics, port: 9090}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-epp-decode
+spec:
+  selector: {app: fc-epp-decode}
+  ports:
+    - {name: grpc, port: 9002, appProtocol: http2}
+    - {name: metrics, port: 9090}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fc-epp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fc-epp
+rules:
+  - apiGroups: [inference.networking.k8s.io]
+    resources: [inferencepools]
+    verbs: [get, list, watch]
+  - apiGroups: [llm-d.ai]
+    resources: [inferenceobjectives, inferencemodelrewrites]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fc-epp
+subjects:
+  - kind: ServiceAccount
+    name: fc-epp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fc-epp
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-coordinator
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fc-coordinator}
+  template:
+    metadata:
+      labels: {app: fc-coordinator}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: coordinator
+          image: ghcr.io/llm-d/llm-d-router-coordinator:v1.0.0
+          args: [--config, /etc/coordinator/coordinator.yaml]
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: metrics, containerPort: 9090}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: config, mountPath: /etc/coordinator}
+      volumes:
+        - name: config
+          configMap: {name: fc-coordinator}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-coordinator
+spec:
+  selector: {app: fc-coordinator}
+  ports:
+    - {name: http, port: 8080}
+    - {name: metrics, port: 9090}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-envoy
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fc-envoy}
+  template:
+    metadata:
+      labels: {app: fc-envoy}
+    spec:
+      containers:
+        - name: envoy
+          image: docker.io/envoyproxy/envoy:distroless-v1.33.2
+          args: [-c, /etc/envoy/envoy.yaml, --log-level, warn]
+          ports:
+            - {name: http, containerPort: 8081}
+            - {name: ready, containerPort: 19001}
+          readinessProbe:
+            httpGet: {path: /ready, port: ready}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: config, mountPath: /etc/envoy}
+      volumes:
+        - name: config
+          configMap: {name: fc-envoy}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-envoy
+spec:
+  selector: {app: fc-envoy}
+  ports:
+    - {name: http, port: 8081}

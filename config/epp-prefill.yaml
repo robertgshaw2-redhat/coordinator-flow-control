@@ -1,0 +1,45 @@
+# Prefill EPP: the only place flow control runs.
+#
+# Every request the coordinator sends with `x-llm-d-epp-profile: prefill` lands
+# here. If the prefill pool is saturated, the request waits in the flow-control
+# queue. If it is still waiting after defaultRequestTTL, it is evicted: the EPP
+# answers 429 with `x-llm-d-request-dropped-reason: rejected-ttl-expired`, and the
+# coordinator passes that 429 back to the client. Nothing has run on a GPU yet,
+# so an evicted request costs nothing.
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+
+featureGates:
+  - flowControl
+
+flowControl:
+  # Queue for up to this long, then evict. This is the "n seconds".
+  defaultRequestTTL: 10s
+  # What "saturated" means: the detector below.
+  saturationDetector:
+    pluginRef: prefill-concurrency
+
+plugins:
+  - type: openai-parser
+  - type: inflight-load-producer
+  # Saturated = every prefill pod has maxConcurrency prefills in flight.
+  # The value is deliberately low so the demo queues; calibrate it per model.
+  - name: prefill-concurrency
+    type: concurrency-detector
+    parameters:
+      concurrencyMode: requests
+      maxConcurrency: 2
+  - type: active-request-scorer
+  - type: max-score-picker
+  - type: single-profile-handler
+
+requestHandler:
+  parsers:
+    - pluginRef: openai-parser
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: prefill-concurrency
+      - pluginRef: active-request-scorer
+      - pluginRef: max-score-picker

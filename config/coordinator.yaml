@@ -1,0 +1,27 @@
+# Text-only P/D: prefill, then decode, each a call back into the gateway.
+log_level: 2
+
+server:
+  listen_addr: ":8080"
+  # Plaintext inside the cluster keeps the example short.
+  secure_serving: false
+  read_timeout: 30s
+  write_timeout: 300s
+  shutdown_timeout: 25s
+
+gateway:
+  address: "http://fc-envoy:8081"
+  max_idle_conns_per_host: 200
+  idle_conn_timeout: 90s
+  # Response-header timeout per phase call. The prefill call does not return
+  # headers until it leaves the queue, so this must exceed the prefill EPP's
+  # defaultRequestTTL plus a prefill, or the coordinator gives up first and the
+  # client sees a 502 instead of the EPP's 429.
+  timeout: 60s
+
+pipeline:
+  kv_connector: kv-nixl
+  use_openai_format: true
+  steps:
+    - type: prefill
+    - type: decode
