@@ -1,0 +1,44 @@
+# Decode EPP, one check: queue when decode is saturated.
+#
+# This is the backstop behind the prefill EPP's decode check. That check reads
+# scraped metrics and lags, so admitted requests can still pile into decode.
+# This EPP dispatches every decode call, so it counts decode load exactly.
+#
+# Its threshold is looser than the prefill EPP's decode check: new work should
+# be held at prefill, before any GPU time is spent. A decode call that waits
+# here has already been prefilled, and its KV is held on the prefill pod.
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+
+featureGates:
+  - flowControl
+
+flowControl:
+  # Longer than prefill's 10s: evicting here throws away a finished prefill.
+  defaultRequestTTL: 30s
+  saturationDetector:
+    pluginRef: d-gate
+
+plugins:
+  - type: openai-parser
+  - type: inflight-load-producer
+  # 14 decode calls in flight per decode pod. With --max-num-seqs 8 that is
+  # 8 running plus about 6 waiting, past the prefill EPP's 4-waiting check.
+  - name: d-gate
+    type: concurrency-detector
+    parameters:
+      concurrencyMode: requests
+      maxConcurrency: 14
+  - type: active-request-scorer
+  - type: max-score-picker
+  - type: single-profile-handler
+
+requestHandler:
+  parsers:
+    - pluginRef: openai-parser
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: active-request-scorer
+      - pluginRef: max-score-picker

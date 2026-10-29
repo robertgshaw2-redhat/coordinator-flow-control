@@ -1,16 +1,7 @@
+# The basic example: flow control on the prefill EPP only. See base/.
+# two-gates/ is the variant with checks on both EPPs.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - vllm.yaml
-  - router.yaml
-
-configMapGenerator:
-  - name: fc-epp-prefill
-    files: [config.yaml=config/epp-prefill.yaml]
-  - name: fc-epp-decode
-    files: [config.yaml=config/epp-decode.yaml]
-  - name: fc-coordinator
-    files: [config/coordinator.yaml]
-  - name: fc-envoy
-    files: [config/envoy.yaml]
+  - base

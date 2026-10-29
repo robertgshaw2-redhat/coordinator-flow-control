@@ -1,0 +1,38 @@
+# The base example with flow control on both EPPs:
+#   prefill EPP: queue if prefill OR decode is saturated (different thresholds)
+#   decode EPP:  queue if decode is saturated
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../base
+
+configMapGenerator:
+  - name: fc-epp-prefill
+    behavior: replace
+    files: [config.yaml=epp-prefill.yaml]
+  - name: fc-epp-decode
+    behavior: replace
+    files: [config.yaml=epp-decode.yaml]
+
+patches:
+  # The prefill EPP has to see decode pods to gate on them.
+  - target: {kind: InferencePool, name: fc-prefill}
+    patch: |-
+      - op: replace
+        path: /spec/selector/matchLabels
+        value: {app: fc-vllm}
+  # Demo only: cap decode at 8 sequences so it saturates under modest load.
+  - target: {kind: Deployment, name: fc-decode}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/args/0
+        value: |-
+          set -euo pipefail
+          python3 -c "import nixl" 2>/dev/null || uv pip install --system nixl nixl-cu13
+          exec vllm serve Qwen/Qwen3-8B \
+            --port 8000 \
+            --max-model-len 16384 \
+            --max-num-seqs 8 \
+            --disable-access-log-for-endpoints=/health,/metrics \
+            --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'

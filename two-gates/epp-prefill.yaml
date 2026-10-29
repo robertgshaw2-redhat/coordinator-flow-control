@@ -1,0 +1,58 @@
+# Prefill EPP, two checks: queue when prefill OR decode is saturated.
+#
+# The fc-prefill InferencePool selects both roles (see kustomization.yaml), so
+# flow control sees decode pods too. It splits the pool by llm-d.ai/role, asks
+# the detector once per stage, and gates on max(S_prefill, S_decode). The
+# scheduling profile still only picks prefill pods.
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+
+featureGates:
+  - flowControl
+
+flowControl:
+  defaultRequestTTL: 10s
+  saturationDetector:
+    pluginRef: p-gate
+
+plugins:
+  - type: openai-parser
+  - type: inflight-load-producer
+  - type: prefill-filter
+  # Check 1, prefill: 2 prefills in flight per prefill pod. This EPP dispatches
+  # every prefill, so its own in-flight count is the true prefill load.
+  - name: prefill-saturation
+    type: concurrency-detector
+    parameters:
+      concurrencyMode: requests
+      maxConcurrency: 2
+  # Check 2, decode: 4 requests waiting per decode pod. Decode calls go through
+  # the decode EPP, so this EPP's in-flight count on decode pods is always 0.
+  # Only the pods' scraped vLLM metrics show decode load here.
+  - name: decode-saturation
+    type: utilization-detector
+    parameters:
+      queueDepthThreshold: 4
+      kvCacheUtilThreshold: 0.9
+  - name: p-gate
+    type: max-saturation-detector
+    parameters:
+      detectors: [prefill-saturation, decode-saturation]
+      stages:
+        prefill-saturation: [prefill]
+        decode-saturation: [decode]
+  - type: active-request-scorer
+  - type: max-score-picker
+  - type: single-profile-handler
+
+requestHandler:
+  parsers:
+    - pluginRef: openai-parser
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: prefill-filter
+      - pluginRef: prefill-saturation
+      - pluginRef: active-request-scorer
+      - pluginRef: max-score-picker

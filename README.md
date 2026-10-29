@@ -12,7 +12,7 @@ client ──> envoy ──(no x-llm-d-epp-profile)──> coordinator
            envoy <──(x-llm-d-epp-profile: decode)─┘  decode EPP: no flow control ─────────> decode vLLM
 ```
 
-The flow-control rule is in [`config/epp-prefill.yaml`](config/epp-prefill.yaml):
+The flow-control rule is in [`base/config/epp-prefill.yaml`](base/config/epp-prefill.yaml):
 
 ```yaml
 featureGates:
@@ -83,6 +83,66 @@ gateway:
 - Measured from the laptop, the client's maximum latency was about 17s. The
   extra time over the gateway figures is `kubectl port-forward` overhead, not
   queueing.
+
+## Variant: gates on both EPPs ([`two-gates/`](two-gates/))
+
+- **Prefill requests get two checks.** They queue when prefill **or** decode is
+  saturated, and each check has its own threshold.
+- **Decode requests get one check.** They queue when decode is saturated.
+
+| EPP | Check | Signal | Threshold | Queue TTL |
+|---|---|---|---|---|
+| prefill | prefill saturated | this EPP's in-flight prefills (`concurrency-detector`) | 2 per prefill pod | 10s |
+| prefill | decode saturated | decode pods' scraped vLLM queue (`utilization-detector`) | 4 waiting per decode pod | (same queue) |
+| decode | decode saturated | this EPP's in-flight decodes (`concurrency-detector`) | 14 per decode pod | 30s |
+
+How it works:
+
+- **The prefill EPP's InferencePool selects both roles.** Flow control splits
+  the pool by `llm-d.ai/role` and computes a saturation for each stage. A
+  `max-saturation-detector` with `stages:` assigns one detector per stage, and
+  flow control gates on `max(S_prefill, S_decode)`.
+- **The prefill EPP has to read decode load from the pods' own metrics.**
+  Decode calls go through the decode EPP, so the prefill EPP's in-flight count
+  on decode pods is always 0.
+- **The decode EPP is the backstop.** It counts decode load exactly. Its
+  threshold is looser than the prefill EPP's decode check, so new work is held
+  at prefill first, before any GPU time is spent. Its TTL is longer because
+  evicting there throws away a finished prefill.
+
+The overlay also caps decode at `--max-num-seqs 8`. That is for the demo only,
+so that decode saturates under modest load.
+
+```sh
+kubectl apply -k two-gates -n robshaw-dev
+./two-gates/demo.py
+```
+
+### Result (2026-10-28, kermit)
+
+**Prefill-heavy phase.** 64 workers sent prompts of about 9k tokens with
+`max_tokens: 16`.
+
+| t | P-EPP prefill | P-EPP decode | P-EPP gate | D-EPP gate |
+|---|---|---|---|---|
+| 12–55s | 1.00 | 0.00–0.01 | 1.00 | 0.00–0.07 |
+
+- The prefill check held the queue. The prefill EPP dispatched 171 requests and
+  evicted 108 on TTL.
+- The decode EPP dispatched all 171 calls without queueing.
+
+**Decode-heavy phase.** 48 workers sent 20-word prompts with
+`max_tokens: 1024`.
+
+| t | P-EPP prefill | P-EPP decode | P-EPP gate | D-EPP gate |
+|---|---|---|---|---|
+| 12–66s | 0.00 | 1.25–1.50 | 1.25–1.50 | 0.93–1.00 |
+
+- Prefill was idle. The prefill EPP's decode check held the queue: it
+  dispatched 93 requests and evicted 126 on TTL.
+- The decode EPP sat at its limit, about 8 running and 6 waiting. It queued 31
+  decode calls for 5–10s each, because the scraped decode signal lags. It
+  evicted none.
 
 ## Knobs
 
